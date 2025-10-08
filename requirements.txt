@@ -1,0 +1,11 @@
+ultralytics
+paddleocr==2.7.0.3
+pdf2image
+pillow
+opencv-python
+numpy
+requests
+python-dotenv
+openai
+google-generativeai
+
