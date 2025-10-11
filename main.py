@@ -14,3 +14,4 @@ if __name__ == "__main__":
 	process_pdf(args.pdf, yolo_weights=args.yolo, out_dir=args.out, make_debug_images=not args.no_debug)
 
 
+

@@ -120,3 +120,4 @@ def run_ppstructure(models: Models, image: Image.Image) -> Optional[str]:
 	return "\n".join(buf) if buf else None
 
 
+

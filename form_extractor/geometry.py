@@ -32,3 +32,4 @@ def polygon_to_bbox(poly: List[List[float]]) -> BBox:
 	return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
 
 
+
