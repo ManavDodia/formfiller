@@ -15,8 +15,8 @@ Pipeline:
 
 Environment / Config:
   - YOLO_MODEL_PATH: path to your trained weights (e.g., "best.pt")
-  - LLM_PROVIDER: "openai" | "ollama" | "gemini"
-  - OPENAI_API_KEY / OLLAMA_HOST / GEMINI_API_KEY as needed
+  - LLM_PROVIDER: "openai" | "ollama" | "gemini" | "groq"
+  - OPENAI_API_KEY / OLLAMA_HOST / GEMINI_API_KEY / GROQ_API_KEY as needed
   - POPPLER must be installed for pdf2image (system dependency)
 
 Install (example):
@@ -82,11 +82,12 @@ except Exception:
 # -----------------------------
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "best.pt")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")  # "openai" | "ollama" | "gemini"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")  # forced to Groq by default
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -104,6 +105,16 @@ logger.addHandler(handler)
 # Data models
 # -----------------------------
 BBox = List[int]  # [x1, y1, x2, y2]
+
+# Map YOLO class names to expected canonical names
+CLASS_ALIASES = {
+    "blank_lines": "line_field",
+    "blank_line": "line_field",
+    "blank_areas": "text_field",
+    "blank_area": "text_field",
+    "table_cells": "table_cell",
+    "table_cell": "table_cell",
+}
 
 @dataclass
 class OCRLine:
@@ -271,6 +282,8 @@ def detect_answer_regions_yolo(models: Models, image: Image.Image) -> List[Detec
             cls_idx = int(boxes.cls[i].item()) if boxes.cls is not None else -1
             conf = float(boxes.conf[i].item()) if boxes.conf is not None else 0.0
             cls_name = names.get(cls_idx, f"class_{cls_idx}")
+            # Normalize class name to expected canonical form
+            cls_name = CLASS_ALIASES.get(cls_name, cls_name)
             bbox = ensure_int_bbox([xyxy[0], xyxy[1], xyxy[2], xyxy[3]])
             dets.append(Detection(bbox=bbox, conf=conf, cls_name=cls_name))
 
@@ -398,8 +411,8 @@ def find_best_answers_for_question(
     qbox: BBox,
     dets: List[Detection],
     page_w: int,
-    right_dx: int = 350,
-    row_dy: int = 120
+    right_dx: int = 600,  # Increased from 350 to find fields further right
+    row_dy: int = 200    # Increased from 120 to allow more vertical tolerance
 ) -> Tuple[str, List[BBox], List[str]]:
     """
     Given a question box, prefer answer regions to the right in same row.
@@ -451,16 +464,18 @@ def find_best_answers_for_question(
                     [x.bbox for x in best_g],
                     [x.cls_name for x in best_g])
 
-    # Fallback: nearest any text-like field
+    # Fallback: nearest any text-like field (even if not to the right)
     any_text: List[Tuple[float, Detection]] = []
     for d in dets:
-        if d.cls_name in ("text_field", "line_field"):
+        if d.cls_name in ("text_field", "line_field", "table_cell"):
             acx, acy = bbox_center(d.bbox)
             any_text.append((euclidean((qcx, qcy), (acx, acy)), d))
     if any_text:
         any_text.sort(key=lambda t: t[0])
         d = any_text[0][1]
-        return "text", [d.bbox], [d.cls_name]
+        # Only accept if within reasonable distance (increased threshold)
+        if euclidean((qcx, qcy), bbox_center(d.bbox)) < 800:
+            return "text", [d.bbox], [d.cls_name]
 
     return "unknown", [], []
 
@@ -527,15 +542,8 @@ def ask_llm_normalize_schema(
         + json.dumps(raw_schema, ensure_ascii=False)
     )
 
-    if provider == "ollama":
-        return _ask_ollama_json(prompt)
-    elif provider == "openai":
-        return _ask_openai_json(prompt)
-    elif provider == "gemini":
-        return _ask_gemini_json(prompt)
-    else:
-        logger.warning(f"Unknown LLM_PROVIDER '{provider}', returning raw schema.")
-        return raw_schema
+    # Force Groq usage only
+    return _ask_groq_json(prompt)
 
 
 def _ask_ollama_json(prompt: str) -> Dict[str, Any]:
@@ -621,6 +629,42 @@ def _ask_gemini_json(prompt: str) -> Dict[str, Any]:
         return {"raw_llm_text": txt}
 
 
+# New: Groq provider
+def _ask_groq_json(prompt: str) -> Dict[str, Any]:
+    """
+    Groq Chat Completions with JSON mode. Requires: pip install groq
+    export GROQ_API_KEY=... or set in .env file
+    """
+    if not GROQ_API_KEY:
+        logger.error("GROQ_API_KEY not set! Please set it in environment or .env file.")
+        return {"error": "GROQ_API_KEY not configured. Set it in .env file or environment variable."}
+    
+    try:
+        from groq import Groq
+    except Exception as e:
+        logger.error("pip install groq to use GROQ provider.")
+        return {"error": str(e)}
+
+    model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        resp = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "Return only valid compact JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0
+        )
+        txt = resp.choices[0].message.content
+        try:
+            return json.loads(txt)
+        except Exception:
+            return {"raw_llm_text": txt}
+    except Exception as e:
+        return {"error": str(e)}
+
 # -----------------------------
 # Main pipeline
 # -----------------------------
@@ -662,8 +706,8 @@ def process_pdf(
             out_img = out_root / "annotated" / f"page_{idx:03d}_annotated.jpg"
             draw_debug(pil_img, ocr_lines, dets, fields, out_img)
 
-    # Build raw schema for LLM
-    raw_schema = {
+    # Build simplified schema focused on question-answer pairing
+    simplified_schema = {
         "document_id": Path(pdf_path).stem,
         "pages": [
             {
@@ -673,34 +717,25 @@ def process_pdf(
                     {
                         "question": f.question_text,
                         "question_bbox": f.question_bbox,
-                        "answer_type": f.answer_type,
                         "answer_bboxes": f.answer_bboxes,
-                        "yolo_classes": f.yolo_classes
+                        "answer_type": f.answer_type
                     }
                     for f in p.fields
+                    if f.answer_bboxes  # Only include fields with detected answer boxes
                 ]
             } for p in page_results
         ]
     }
 
-    logger.info("Calling LLM to normalize schema...")
-    normalized = ask_llm_normalize_schema(LLM_PROVIDER, raw_schema)
-
-    # Save outputs
+    # Save simplified output
     schema_path = out_root / "document_schema.json"
     with open(schema_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "raw": raw_schema,
-                "normalized": normalized
-            },
-            f, indent=2, ensure_ascii=False
-        )
+        json.dump(simplified_schema, f, indent=2, ensure_ascii=False)
 
     logger.info(f"Done. Wrote schema to: {schema_path}")
     logger.info(f"Total time: {time.time() - t0:.1f}s")
 
-    doc = DocumentSchema(pages=page_results, normalized_schema=normalized)
+    doc = DocumentSchema(pages=page_results, normalized_schema=simplified_schema)
     return doc
 
 

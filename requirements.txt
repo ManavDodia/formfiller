@@ -3,9 +3,10 @@ paddleocr==2.7.0.3
 pdf2image
 pillow
 opencv-python
-numpy
+numpy==1.26.4
 requests
 python-dotenv
 openai
 google-generativeai
-
+groq
+paddlepaddle
