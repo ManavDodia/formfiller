@@ -1,9 +1,10 @@
-transformers
-torch
-torchvision
+ultralytics
 pillow
 pdf2image
 opencv-python
 numpy
 requests
 python-dotenv
+
+
+

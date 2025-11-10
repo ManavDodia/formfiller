@@ -1,13 +1,13 @@
 """
 End-to-end Form Schema Extractor
 --------------------------------
-Input: PDF path to a (scanned or digital) form
+Input: PDF path or image file (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp) to a (scanned or digital) form
 Output:
   - /output/annotated/page_XXX_annotated.jpg  (visual debug)
   - /output/document_schema.json              (final normalized schema)
 
 Pipeline:
-  1) PDF -> images (pdf2image)
+  1) PDF/Image -> images (pdf2image for PDFs, direct PIL load for images)
   2) YOLO -> answer regions (text fields, checkboxes, radios, signatures, dates, etc.)
   3) PaddleOCR -> question-like text lines (+ optional PPStructureV3 for structure)
   4) Pair questions to answer regions using layout heuristics (right/same-row bias)
@@ -17,7 +17,7 @@ Environment / Config:
   - YOLO_MODEL_PATH: path to your trained weights (e.g., "best.pt")
   - LLM_PROVIDER: "openai" | "ollama" | "gemini"
   - OPENAI_API_KEY / OLLAMA_HOST / GEMINI_API_KEY as needed
-  - POPPLER must be installed for pdf2image (system dependency)
+  - POPPLER must be installed for PDF processing (system dependency)
 
 Install (example):
   pip install ultralytics paddleocr==2.7.0.3 pdf2image pillow opencv-python numpy requests python-dotenv
@@ -26,6 +26,7 @@ Notes:
   - PPStructureV3 (optional) can improve page-level grouping. If not installed, we skip it.
   - BBoxes are [x1, y1, x2, y2] in pixel coordinates of the page image.
   - Coordinate system origin at top-left.
+  - Image files are loaded directly; PDFs are converted to images using pdf2image.
 
 Author: You + ChatGPT
 """
@@ -218,13 +219,41 @@ def draw_debug(
 
 
 # -----------------------------
-# PDF -> Images
+# File Input Detection & Conversion
 # -----------------------------
-def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[Image.Image]:
+def is_pdf(file_path: str) -> bool:
+    """Check if file is a PDF by extension."""
+    return Path(file_path).suffix.lower() == ".pdf"
+
+
+def is_image(file_path: str) -> bool:
+    """Check if file is an image by extension."""
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+    return Path(file_path).suffix.lower() in image_extensions
+
+
+def load_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
     """
-    Requires poppler installed on system. On Windows, set POPPLER_PATH env or pass to convert_from_path.
+    Load images from PDF or image file.
+    - If PDF: converts to images using pdf2image
+    - If image: loads directly using PIL
+    Requires poppler installed for PDFs on system.
     """
-    return convert_from_path(pdf_path, dpi=dpi)
+    if is_pdf(file_path):
+        logger.info(f"Detected PDF file: {file_path}")
+        return convert_from_path(file_path, dpi=dpi)
+    elif is_image(file_path):
+        logger.info(f"Detected image file: {file_path}")
+        img = Image.open(file_path)
+        # Convert to RGB if necessary (e.g., RGBA, P mode)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return [img]
+    else:
+        raise ValueError(
+            f"Unsupported file type: {file_path}. "
+            f"Supported formats: PDF (.pdf) or images (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp)"
+        )
 
 
 # -----------------------------
@@ -237,7 +266,12 @@ class Models:
 
         logger.info("Initializing PaddleOCR...")
         # angle cls helps with rotated text; lang 'en' by default
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
+        # Use use_textline_orientation instead of deprecated use_angle_cls
+        try:
+            self.ocr = PaddleOCR(use_textline_orientation=True, lang='en')
+        except TypeError:
+            # Fallback for older versions that still use use_angle_cls
+            self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
         logger.info("PaddleOCR ready.")
 
         if _HAS_PPSTRUCT:
@@ -630,13 +664,17 @@ def process_pdf(
     out_dir: str = OUTPUT_DIR,
     make_debug_images: bool = True
 ) -> DocumentSchema:
+    """
+    Process a PDF or image file to extract form schema.
+    Supports both PDF files and image files (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp).
+    """
     t0 = time.time()
     out_root = Path(out_dir)
     (out_root / "annotated").mkdir(parents=True, exist_ok=True)
 
     models = Models(yolo_weights)
 
-    pages = pdf_to_images(pdf_path, dpi=300)
+    pages = load_images(pdf_path, dpi=300)
     page_results: List[PageResult] = []
 
     for idx, pil_img in enumerate(pages, start=1):
@@ -710,8 +748,11 @@ def process_pdf(
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="Extract form schema from a PDF.")
-    ap.add_argument("pdf", help="Path to form PDF")
+    ap = argparse.ArgumentParser(
+        description="Extract form schema from a PDF or image file. "
+        "Supports PDF (.pdf) and image files (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp)."
+    )
+    ap.add_argument("pdf", help="Path to form PDF or image file")
     ap.add_argument("--yolo", default=YOLO_MODEL_PATH, help="Path to YOLO weights (default: best.pt or $YOLO_MODEL_PATH)")
     ap.add_argument("--out", default=OUTPUT_DIR, help="Output dir (default: ./output)")
     ap.add_argument("--no-debug", action="store_true", help="Disable annotated debug images")
