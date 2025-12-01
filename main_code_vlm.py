@@ -263,10 +263,14 @@ class OllamaVLMModel:
         image.save(buffered, format="PNG")
         return base64.b64encode(buffered.getvalue()).decode()
 
-    def _call_vlm(self, prompt: str, image: Image.Image, timeout: int = 180) -> str:
+    def _call_vlm(self, prompt: str, image: Optional[Image.Image], timeout: int = 600) -> str:
         """Generic VLM call method."""
+        # Handle None image gracefully
+        if image is None:
+            image = Image.new("RGB", (1, 1), color="white")
+
         img_base64 = self._image_to_base64(image)
-        
+
         try:
             response = requests.post(
                 f"{self.host}/api/chat",
@@ -290,6 +294,7 @@ class OllamaVLMModel:
         except Exception as e:
             logger.error(f"VLM call error: {e}")
             return "{}"
+
 
     def extract_questions_and_match(
         self, 
@@ -368,7 +373,8 @@ Return ONLY valid JSON with this EXACT structure (no markdown, no extra text):
 **CRITICAL:** Return ONLY the JSON object, nothing else. Do not include explanations outside JSON."""
 
         logger.info(f"Calling VLM for question extraction and matching...")
-        response = self._call_vlm(prompt, image, timeout=180)
+        dummy_img = Image.new("RGB", (1, 1), color="white")
+        response = self._call_vlm(prompt, image, timeout=500)
         
         # Parse VLM response
         fields = self._parse_vlm_matching_response(response, detections, page_w, page_h)
@@ -500,11 +506,10 @@ Return ONLY this JSON structure (no markdown, no extra text):
 **CRITICAL:** Return ONLY the JSON object. No explanations outside JSON."""
 
         logger.info("Calling VLM for schema normalization...")
-        response = self._call_vlm(prompt, None, timeout=500)
-        
         # For normalization, we don't need an image, but API requires it
         # Create a dummy 1x1 image
         dummy_img = Image.new('RGB', (1, 1), color='white')
+        response = self._call_vlm(prompt, dummy_img, timeout=500)
         
         try:
             # Override to use non-vision endpoint if available
