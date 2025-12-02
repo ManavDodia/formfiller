@@ -320,7 +320,7 @@ def ocr_image(models: Models, image: Image.Image) -> List[OCRLine]:
     Handles both dict (new) and list (old) PaddleOCR return formats.
     """
     img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    out = models.ocr.ocr(img_bgr)
+    out = models.ocr.predict(img_bgr)
 
     lines: List[OCRLine] = []
     if not out:

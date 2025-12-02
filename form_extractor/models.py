@@ -64,7 +64,7 @@ def detect_answer_regions_yolo(models: Models, image: Image.Image) -> List[Detec
 
 def ocr_image(models: Models, image: Image.Image) -> List[OCRLine]:
 	img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-	out = models.ocr.ocr(img_bgr)
+	out = models.ocr.predict(img_bgr)
 
 	lines: List[OCRLine] = []
 	if not out:

@@ -30,12 +30,25 @@ def ask_llm_normalize_schema(provider: str, raw_schema: Dict[str, Any]) -> Dict[
 
 def _ask_ollama_json(prompt: str) -> Dict[str, Any]:
 	import requests
-	model = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
+	model = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b")
 
 	r = requests.post(
 		f"{OLLAMA_HOST}/api/generate",
 		json={"model": model, "prompt": prompt, "stream": False, "format": "json"}
 	)
+	if r.status_code != 200:
+		# Log the error for debugging
+		try:
+			error_detail = r.json().get("error", r.text)
+			logger.warning(f"Ollama request failed: {error_detail}")
+		except:
+			logger.warning(f"Ollama request failed with status {r.status_code}: {r.text[:200]}")
+		# If format: json fails, try without it (some models don't support it)
+		logger.info("Retrying without format=json constraint...")
+		r = requests.post(
+			f"{OLLAMA_HOST}/api/generate",
+			json={"model": model, "prompt": prompt + "\n\nReturn ONLY valid JSON.", "stream": False}
+		)
 	r.raise_for_status()
 	obj = r.json()
 	txt = obj.get("response", "{}")
