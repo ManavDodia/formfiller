@@ -1,44 +1,37 @@
 """
-End-to-end Form Schema Extractor
---------------------------------
-Input: PDF path to a (scanned or digital) form
+LLM-Enhanced Form Schema Extractor
+-----------------------------------
+Input: PDF path or image file (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp)
 Output:
   - /output/annotated/page_XXX_annotated.jpg  (visual debug)
   - /output/document_schema.json              (final normalized schema)
 
 Pipeline:
-  1) PDF -> images (pdf2image)
+  1) PDF/Image -> images (pdf2image for PDFs, direct PIL load for images)
   2) YOLO -> answer regions (text fields, checkboxes, radios, signatures, dates, etc.)
-  3) PaddleOCR -> question-like text lines (+ optional PPStructureV3 for structure)
-  4) Pair questions to answer regions using layout heuristics (right/same-row bias)
-  5) Ask LLM -> normalized JSON schema (stable keys, types, options, bboxes, page refs)
+  3) PaddleOCR -> all text lines with bboxes
+  4) LLM -> identify questions + match to answer regions (replaces heuristics)
+  5) LLM -> final normalized JSON schema
 
 Environment / Config:
   - YOLO_MODEL_PATH: path to your trained weights (e.g., "best.pt")
-  - LLM_PROVIDER: "openai" | "ollama" | "gemini"
-  - OPENAI_API_KEY / OLLAMA_HOST / GEMINI_API_KEY as needed
-  - POPPLER must be installed for pdf2image (system dependency)
+  - OLLAMA_HOST: Ollama server URL (default: http://localhost:11434)
+  - OLLAMA_MODEL: Ollama model name (default: llama3.1:latest)
+  - POPPLER must be installed for PDF processing (system dependency)
 
 Install (example):
   pip install ultralytics paddleocr==2.7.0.3 pdf2image pillow opencv-python numpy requests python-dotenv
 
-Notes:
-  - PPStructureV3 (optional) can improve page-level grouping. If not installed, we skip it.
-  - BBoxes are [x1, y1, x2, y2] in pixel coordinates of the page image.
-  - Coordinate system origin at top-left.
-
-Author: You + ChatGPT
+Author: Enhanced version with LLM-based matching
 """
 
 from __future__ import annotations
 
 import os
-import io
 import json
 import math
 import time
 import uuid
-import base64
 import logging
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -61,14 +54,6 @@ except Exception as e:
         f"Original import error: {e}"
     )
 
-# Optional: PPStructureV3 for page-structure parsing (tables, titles, etc.)
-try:
-    from paddleocr.ppstructure.recovery.recovery_to_doc import sorted_layout_boxes  # noqa
-    from paddleocr import PPStructure
-    _HAS_PPSTRUCT = True
-except Exception:
-    _HAS_PPSTRUCT = False
-
 # Optional: .env for local config
 try:
     from dotenv import load_dotenv
@@ -82,11 +67,9 @@ except Exception:
 # -----------------------------
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "best.pt")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")  # "openai" | "ollama" | "gemini"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
 
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -121,9 +104,10 @@ class Detection:
 class FieldCandidate:
     question_text: str
     question_bbox: BBox
-    answer_type: str                 # "text", "checkbox", "radio", "signature", "date", "table_cell", "unknown"
-    answer_bboxes: List[BBox]        # could be multi (e.g., options in radio/checkbox groups)
+    answer_type: str
+    answer_bboxes: List[BBox]
     yolo_classes: List[str] = field(default_factory=list)
+    options: List[str] = field(default_factory=list)  # For radio/checkbox
 
 @dataclass
 class PageResult:
@@ -137,7 +121,6 @@ class PageResult:
 @dataclass
 class DocumentSchema:
     pages: List[PageResult]
-    # Normalized, LLM-curated schema per document level
     normalized_schema: Optional[Dict[str, Any]] = None
 
 
@@ -151,28 +134,6 @@ def bbox_center(b: BBox) -> Tuple[int, int]:
     x1, y1, x2, y2 = b
     return (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-def bbox_area(b: BBox) -> int:
-    x1, y1, x2, y2 = b
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-def iou(a: BBox, b: BBox) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-    inter = iw * ih
-    union = bbox_area(a) + bbox_area(b) - inter + 1e-6
-    return inter / union
-
-def euclidean(p1: Tuple[int, int], p2: Tuple[int, int]) -> float:
-    return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
-
-def slugify(text: str) -> str:
-    s = "".join(ch if ch.isalnum() else "_" for ch in text.strip().lower())
-    s = "_".join([t for t in s.split("_") if t])
-    return s[:60] or f"field_{uuid.uuid4().hex[:6]}"
-
 def draw_debug(
     img: Image.Image,
     ocr_lines: List[OCRLine],
@@ -184,47 +145,72 @@ def draw_debug(
     draw = ImageDraw.Draw(im)
     try:
         font = ImageFont.truetype("arial.ttf", 16)
+        small_font = ImageFont.truetype("arial.ttf", 12)
     except Exception:
         font = ImageFont.load_default()
+        small_font = ImageFont.load_default()
 
-    # Draw detections
+    # Draw detections (YOLO answer regions)
     for d in dets:
         draw.rectangle(d.bbox, outline="green", width=2)
-        draw.text((d.bbox[0], d.bbox[1]-16), f"{d.cls_name} {d.conf:.2f}", fill="green", font=font)
+        draw.text((d.bbox[0], d.bbox[1]-16), f"{d.cls_name} {d.conf:.2f}", fill="green", font=small_font)
 
-    # Draw OCR lines (questions are not preselected; draw all in light)
+    # Draw all OCR lines (light gray for non-questions)
     for l in ocr_lines:
-        draw.rectangle(l.bbox, outline="orange", width=1)
-        if l.text:
-            draw.text((l.bbox[0], l.bbox[1]-14), l.text[:40], fill="orange", font=font)
+        draw.rectangle(l.bbox, outline="lightgray", width=1)
 
-    # Draw field links
+    # Draw matched fields
     for f in fields:
-        # Question
+        # Question box (blue)
         draw.rectangle(f.question_bbox, outline="blue", width=3)
-        qlabel = f"{f.answer_type} | {f.question_text[:30]}"
+        qlabel = f"{f.answer_type} | {f.question_text[:40]}"
         draw.text((f.question_bbox[0], f.question_bbox[1]-18), qlabel, fill="blue", font=font)
-        # Answer boxes
+        
+        # Answer boxes (red)
         for ab in f.answer_bboxes:
             draw.rectangle(ab, outline="red", width=3)
 
-        # Link question center -> first answer center
+        # Link question to first answer
         if f.answer_bboxes:
             qc = bbox_center(f.question_bbox)
             ac = bbox_center(f.answer_bboxes[0])
             draw.line([qc, ac], fill="cyan", width=2)
+        
+        # Draw options if available
+        if f.options and f.answer_bboxes:
+            for i, opt in enumerate(f.options):
+                if i < len(f.answer_bboxes):
+                    ab = f.answer_bboxes[i]
+                    draw.text((ab[2] + 5, ab[1]), opt[:20], fill="purple", font=small_font)
 
     im.save(out_path)
 
 
 # -----------------------------
-# PDF -> Images
+# File Input Detection & Conversion
 # -----------------------------
-def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[Image.Image]:
-    """
-    Requires poppler installed on system. On Windows, set POPPLER_PATH env or pass to convert_from_path.
-    """
-    return convert_from_path(pdf_path, dpi=dpi)
+def is_pdf(file_path: str) -> bool:
+    return Path(file_path).suffix.lower() == ".pdf"
+
+def is_image(file_path: str) -> bool:
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+    return Path(file_path).suffix.lower() in image_extensions
+
+def load_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
+    if is_pdf(file_path):
+        logger.info(f"Detected PDF file: {file_path}")
+        return convert_from_path(file_path, dpi=dpi)
+    elif is_image(file_path):
+        logger.info(f"Detected image file: {file_path}")
+        img = Image.open(file_path)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return [img]
+    else:
+        raise ValueError(
+            f"Unsupported file type: {file_path}. "
+            f"Supported formats: PDF (.pdf) or images (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp)"
+        )
 
 
 # -----------------------------
@@ -236,29 +222,24 @@ class Models:
         self.yolo = YOLO(yolo_path)
 
         logger.info("Initializing PaddleOCR...")
-        # angle cls helps with rotated text; lang 'en' by default
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
+        try:
+            self.ocr = PaddleOCR(use_textline_orientation=True, lang='en', show_log=False)
+        except (TypeError, ValueError):
+            # Fallback for older PaddleOCR versions that don't support show_log or use_textline_orientation
+            try:
+                self.ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+            except (TypeError, ValueError):
+                # Final fallback: remove unsupported parameters
+                self.ocr = PaddleOCR(lang='en')
         logger.info("PaddleOCR ready.")
-
-        if _HAS_PPSTRUCT:
-            logger.info("PPStructure available. Using lightweight defaults.")
-            # Defaults; tweak as needed
-            self.ppstruct = PPStructure(show_log=False)
-        else:
-            self.ppstruct = None
 
 
 # -----------------------------
 # Inference: YOLO
 # -----------------------------
 def detect_answer_regions_yolo(models: Models, image: Image.Image) -> List[Detection]:
-    """
-    Runs YOLO. Your trained classes may include e.g.:
-      - text_field, line_field, checkbox, radio, signature, date, table_cell, table, etc.
-    Returns list of Detection with class names and conf.
-    """
-    np_img = np.array(image)  # RGB
-    results = models.yolo(np_img)
+    np_img = np.array(image)
+    results = models.yolo(np_img, verbose=False)
     dets: List[Detection] = []
 
     for r in results:
@@ -278,18 +259,25 @@ def detect_answer_regions_yolo(models: Models, image: Image.Image) -> List[Detec
 
 
 # -----------------------------
-# Inference: OCR (+ optional structure)
+# Inference: OCR
 # -----------------------------
 def ocr_image(models: Models, image: Image.Image) -> List[OCRLine]:
-    """
-    Returns OCR lines as [{text, confidence, bbox}], with bbox = [x1,y1,x2,y2].
-    Handles both dict (new) and list (old) PaddleOCR return formats.
-    """
     img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    out = models.ocr.ocr(img_bgr)
+    
+    # Try different API methods for different PaddleOCR versions
+    try:
+        # Newer API: use predict() method
+        out = models.ocr.predict(img_bgr)
+    except (AttributeError, TypeError):
+        try:
+            # Older API: use ocr() without cls parameter
+            out = models.ocr.ocr(img_bgr)
+        except TypeError:
+            # Very old API: use ocr() with cls parameter
+            out = models.ocr.ocr(img_bgr, cls=True)
 
     lines: List[OCRLine] = []
-    if not out:
+    if not out or not out[0]:
         return lines
 
     result = out[0]
@@ -306,7 +294,6 @@ def ocr_image(models: Models, image: Image.Image) -> List[OCRLine]:
             bbox = polygon_to_bbox(poly) if poly else [0, 0, 0, 0]
             lines.append(OCRLine(text=txt, confidence=conf, bbox=ensure_int_bbox(bbox)))
     else:
-        # old format: list of [poly, (text, conf)]
         for entry in result:
             try:
                 poly, (txt, conf) = entry
@@ -320,309 +307,329 @@ def ocr_image(models: Models, image: Image.Image) -> List[OCRLine]:
 
     return lines
 
-
 def polygon_to_bbox(poly: List[List[float]]) -> BBox:
     xs = [p[0] for p in poly]
     ys = [p[1] for p in poly]
     return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
 
 
-def run_ppstructure(models: Models, image: Image.Image) -> Optional[str]:
-    """
-    Optional: returns a coarse page text with region labels (table/para/title/etc.)
-    to give the LLM more structured context. Skips if PPStructure not available.
-    """
-    if not models.ppstruct:
-        return None
-    img_np = np.array(image)
-    result = models.ppstruct(img_np)
-    buf: List[str] = []
-    for res in result:
-        plist = res.get("res", {}).get("layout_res", []) or res.get("res", [])
-        for elem in plist:
-            label = elem.get("label", "region")
-            text = elem.get("text", "").strip()
-            if text:
-                buf.append(f"[{label}] {text}")
-    return "\n".join(buf) if buf else None
-
-
 # -----------------------------
-# Pairing logic
+# LLM Question Identification & Matching
 # -----------------------------
-QUESTION_HARD_MARKERS = (":", "?", "->")
-
-def looks_like_question(line: OCRLine, page_w: int) -> bool:
-    # Heuristics: short(ish) left-column text or explicit markers
-    t = line.text
-    if not t:
-        return False
-    if t.endswith(QUESTION_HARD_MARKERS):
-        return True
-    if len(t) <= 60 and line.bbox[0] < page_w * 0.55:
-        # Filter out pure numbers/noise
-        if any(ch.isalpha() for ch in t):
-            w = line.bbox[2] - line.bbox[0]
-            h = line.bbox[3] - line.bbox[1]
-            if w >= 15 and h >= 10:
-                return True
-    return False
-
-
-def group_choices_nearby(dets: List[Detection], max_gap_px: int = 60) -> List[List[Detection]]:
-    """
-    Groups nearby checkboxes/radios into options sets (same row/column).
-    Simple agglomerative approach by proximity.
-    """
-    ch = [d for d in dets if d.cls_name in ("checkbox", "radio")]
-    groups: List[List[Detection]] = []
-    used = set()
-    for i, d in enumerate(ch):
-        if i in used:
-            continue
-        g = [d]
-        used.add(i)
-        c1 = bbox_center(d.bbox)
-        for j, e in enumerate(ch):
-            if j in used:
-                continue
-            c2 = bbox_center(e.bbox)
-            if euclidean(c1, c2) <= max_gap_px:
-                g.append(e)
-                used.add(j)
-        groups.append(sorted(g, key=lambda x: x.bbox[1]))
-    return groups
-
-
-def find_best_answers_for_question(
-    qbox: BBox,
-    dets: List[Detection],
-    page_w: int,
-    right_dx: int = 350,
-    row_dy: int = 120
-) -> Tuple[str, List[BBox], List[str]]:
-    """
-    Given a question box, prefer answer regions to the right in same row.
-    If none, fallback to nearest text_field/line_field.
-    Also handles checkbox/radio groups near the question.
-    """
-    qcx, qcy = bbox_center(qbox)
-
-    # First pass: text-like fields to the right, near same row
-    candidates: List[Tuple[float, Detection]] = []
-    for d in dets:
-        if d.cls_name in ("text_field", "line_field", "date", "signature", "table_cell"):
-            acx, acy = bbox_center(d.bbox)
-            dx, dy = acx - qcx, abs(acy - qcy)
-            if dx >= 0 and dx <= right_dx and dy <= row_dy:
-                candidates.append((euclidean((qcx, qcy), (acx, acy)), d))
-
-    if candidates:
-        candidates.sort(key=lambda t: t[0])
-        d = candidates[0][1]
-        atype = {
-            "text_field": "text",
-            "line_field": "text",
-            "date": "date",
-            "signature": "signature",
-            "table_cell": "table_cell"
-        }.get(d.cls_name, "text")
-        return atype, [d.bbox], [d.cls_name]
-
-    # Second pass: nearby checkbox/radio groups
-    choice_dets = [d for d in dets if d.cls_name in ("checkbox", "radio")]
-    if choice_dets:
-        groups = group_choices_nearby(dets)
-        best_g = None
-        best_dist = 1e9
-        for g in groups:
-            # group center
-            gc = bbox_center([
-                min(x.bbox[0] for x in g),
-                min(x.bbox[1] for x in g),
-                max(x.bbox[2] for x in g),
-                max(x.bbox[3] for x in g),
-            ])
-            d = euclidean((qcx, qcy), gc)
-            if d < best_dist:
-                best_g, best_dist = g, d
-        if best_g and best_dist < 300:  # threshold
-            return ("radio" if all(x.cls_name == "radio" for x in best_g) else "checkbox",
-                    [x.bbox for x in best_g],
-                    [x.cls_name for x in best_g])
-
-    # Fallback: nearest any text-like field
-    any_text: List[Tuple[float, Detection]] = []
-    for d in dets:
-        if d.cls_name in ("text_field", "line_field"):
-            acx, acy = bbox_center(d.bbox)
-            any_text.append((euclidean((qcx, qcy), (acx, acy)), d))
-    if any_text:
-        any_text.sort(key=lambda t: t[0])
-        d = any_text[0][1]
-        return "text", [d.bbox], [d.cls_name]
-
-    return "unknown", [], []
-
-
-def build_fields_for_page(
+def llm_match_questions_to_answers(
     ocr_lines: List[OCRLine],
-    dets: List[Detection],
+    detections: List[Detection],
+    page_w: int,
+    page_h: int,
+    page_image: Optional[Image.Image] = None
+) -> List[FieldCandidate]:
+    """
+    Use LLM to:
+    1. Identify which OCR text lines are questions
+    2. Match each question to its corresponding answer field(s) from YOLO detections
+    3. Infer options for checkbox/radio groups
+    """
+    
+    # Prepare data for LLM
+    page_data = {
+        "page_size": {"width": page_w, "height": page_h},
+        "ocr_text": [
+            {
+                "id": f"text_{i}",
+                "text": line.text,
+                "bbox": line.bbox,
+                "confidence": round(line.confidence, 3)
+            }
+            for i, line in enumerate(ocr_lines)
+        ],
+        "answer_fields": [
+            {
+                "id": f"field_{i}",
+                "type": det.cls_name,
+                "bbox": det.bbox,
+                "confidence": round(det.conf, 3)
+            }
+            for i, det in enumerate(detections)
+        ]
+    }
+
+    # Enhanced prompt for vision models
+    if page_image and "vision" in OLLAMA_MODEL.lower():
+        prompt = f"""You are analyzing this form image. I've also extracted text and detected answer fields for you.
+
+Your task:
+1. Look at the form image to understand the layout
+2. Identify which text lines are questions (labels asking for user input)
+3. Match each question to its corresponding answer field(s) based on what you see
+4. For checkbox/radio groups, identify option labels
+
+Extracted Data:
+{json.dumps(page_data, indent=2)}
+
+IMPORTANT: Return ONLY valid JSON in this exact format (no markdown, no explanations):
+{{
+  "fields": [
+    {{
+      "question_text_id": "text_0",
+      "question_text": "Full Name:",
+      "answer_field_ids": ["field_5"],
+      "answer_type": "text",
+      "options": []
+    }}
+  ]
+}}
+
+Available answer_types: text, checkbox, radio, signature, date, table_cell, unknown"""
+    else:
+        # Text-only prompt (for non-vision models)
+        prompt = f"""You are analyzing a form page. Your task is to:
+1. Identify which text lines are questions (labels asking for user input)
+2. Match each question to its corresponding answer field(s) based on spatial layout
+3. For checkbox/radio groups, identify option labels if present
+
+IMPORTANT RULES:
+- Questions typically end with ":", "?", or "->" but can also be plain labels
+- Answer fields are usually to the RIGHT or BELOW questions
+- For checkbox/radio groups, look for nearby option labels (like "Male", "Female")
+- Return ONLY valid JSON, no markdown, no explanations
+
+Page Data:
+{json.dumps(page_data, indent=2)}
+
+Return JSON in this EXACT format:
+{{
+  "fields": [
+    {{
+      "question_text_id": "text_0",
+      "question_text": "Full Name:",
+      "answer_field_ids": ["field_5"],
+      "answer_type": "text",
+      "options": []
+    }},
+    {{
+      "question_text_id": "text_3",
+      "question_text": "Gender:",
+      "answer_field_ids": ["field_8", "field_9"],
+      "answer_type": "radio",
+      "options": ["Male", "Female"]
+    }}
+  ]
+}}
+
+Available answer_types: text, checkbox, radio, signature, date, table_cell, unknown
+Return empty array if no fields found."""
+
+    logger.info("Calling LLM for question identification and matching...")
+    
+    try:
+        llm_response = call_ollama(prompt, json_mode=True, image=page_image)
+            
+        fields_data = llm_response.get("fields", [])
+        
+        # Convert LLM response to FieldCandidate objects
+        fields: List[FieldCandidate] = []
+        
+        for field_data in fields_data:
+            # Find question bbox
+            q_text_id = field_data.get("question_text_id", "")
+            question_bbox = None
+            for ocr_item in page_data["ocr_text"]:
+                if ocr_item["id"] == q_text_id:
+                    question_bbox = ocr_item["bbox"]
+                    break
+            
+            if not question_bbox:
+                logger.warning(f"Could not find bbox for question: {field_data.get('question_text')}")
+                continue
+            
+            # Find answer bboxes
+            answer_field_ids = field_data.get("answer_field_ids", [])
+            answer_bboxes = []
+            yolo_classes = []
+            
+            for ans_id in answer_field_ids:
+                for field_item in page_data["answer_fields"]:
+                    if field_item["id"] == ans_id:
+                        answer_bboxes.append(field_item["bbox"])
+                        yolo_classes.append(field_item["type"])
+                        break
+            
+            if not answer_bboxes:
+                logger.warning(f"No answer fields found for question: {field_data.get('question_text')}")
+                continue
+            
+            fields.append(FieldCandidate(
+                question_text=field_data.get("question_text", ""),
+                question_bbox=question_bbox,
+                answer_type=field_data.get("answer_type", "unknown"),
+                answer_bboxes=answer_bboxes,
+                yolo_classes=yolo_classes,
+                options=field_data.get("options", [])
+            ))
+        
+        logger.info(f"LLM identified {len(fields)} fields")
+        return fields
+        
+    except Exception as e:
+        logger.error(f"LLM matching failed: {e}")
+        logger.info("Falling back to basic heuristic matching...")
+        return fallback_heuristic_matching(ocr_lines, detections, page_w, page_h)
+
+
+def fallback_heuristic_matching(
+    ocr_lines: List[OCRLine],
+    detections: List[Detection],
     page_w: int,
     page_h: int
 ) -> List[FieldCandidate]:
-    # Select question-like lines
-    questions = [l for l in ocr_lines if looks_like_question(l, page_w)]
-
-    # If nothing looks like a question, fall back to left-most N lines
-    if not questions:
-        questions = sorted(ocr_lines, key=lambda l: l.bbox[0])[:6]
-
+    """Simple fallback if LLM fails - basic left-to-right matching"""
     fields: List[FieldCandidate] = []
-    for q in questions:
-        atype, aboxes, cls_list = find_best_answers_for_question(q.bbox, dets, page_w)
-        fields.append(FieldCandidate(
-            question_text=q.text,
-            question_bbox=q.bbox,
-            answer_type=atype,
-            answer_bboxes=aboxes,
-            yolo_classes=cls_list
-        ))
+    
+    # Sort OCR lines by vertical position
+    sorted_ocr = sorted(ocr_lines, key=lambda l: l.bbox[1])
+    
+    for ocr_line in sorted_ocr[:10]:  # Limit to first 10 lines
+        # Find nearest detection to the right
+        qcx, qcy = bbox_center(ocr_line.bbox)
+        
+        nearest_det = None
+        min_dist = float('inf')
+        
+        for det in detections:
+            dcx, dcy = bbox_center(det.bbox)
+            
+            # Prefer fields to the right and roughly same vertical position
+            if dcx > qcx and abs(dcy - qcy) < 100:
+                dist = math.hypot(dcx - qcx, dcy - qcy)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_det = det
+        
+        if nearest_det:
+            atype = {
+                "text_field": "text",
+                "line_field": "text",
+                "checkbox": "checkbox",
+                "radio": "radio",
+                "date": "date",
+                "signature": "signature",
+                "table_cell": "table_cell"
+            }.get(nearest_det.cls_name, "unknown")
+            
+            fields.append(FieldCandidate(
+                question_text=ocr_line.text,
+                question_bbox=ocr_line.bbox,
+                answer_type=atype,
+                answer_bboxes=[nearest_det.bbox],
+                yolo_classes=[nearest_det.cls_name]
+            ))
+    
     return fields
 
 
 # -----------------------------
-# LLM Normalization
+# LLM API Calls (Ollama only)
 # -----------------------------
-def ask_llm_normalize_schema(
-    provider: str,
+def call_ollama(prompt: str, json_mode: bool = True, image: Optional[Image.Image] = None) -> Dict[str, Any]:
+    import requests
+    import base64
+    from io import BytesIO
+    
+    if not OLLAMA_HOST:
+        raise ValueError("OLLAMA_HOST not set")
+    
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+    
+    if json_mode:
+        payload["format"] = "json"
+    
+    # Add image for vision models
+    if image and "vision" in OLLAMA_MODEL.lower():
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        payload["images"] = [img_base64]
+    
+    try:
+        response = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json=payload,
+            timeout=(10, 600)
+        )
+        response.raise_for_status()
+        text = response.json().get("response", "{}")
+        
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to extract JSON from text
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(text[start:end])
+            raise
+            
+    except Exception as e:
+        logger.error(f"Ollama API error: {e}")
+        return {"error": str(e)}
+
+
+# -----------------------------
+# Final Schema Normalization
+# -----------------------------
+def normalize_schema_with_llm(
     raw_schema: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Calls your chosen LLM to normalize and verify the schema.
-    - Ensures stable ids, types, and per-option metadata for checkboxes/radios
-    - Returns a JSON object with:
-        {
-          "document_title": "...",
-          "fields": [
-            {
-              "id": "full_name",
-              "label": "Full Name",
-              "type": "text"|"checkbox"|"radio"|"signature"|"date"|"table_cell"|"unknown",
-              "page": 1,
-              "question_bbox": [x1,y1,x2,y2],
-              "answer_bboxes": [[...], [...]],
-              "options": ["Male","Female"]              # when radio/checkbox & text nearby inferred
-            }, ...
-          ]
-        }
-    """
-    prompt = (
-        "You are given a raw extracted schema for a form. "
-        "Normalize it to a clean JSON with stable ids (snake_case), "
-        "human-readable labels, types (text, checkbox, radio, signature, date, table_cell, unknown), "
-        "and preserve all bounding boxes + page numbers exactly. "
-        "If you can infer option labels for checkbox/radio from nearby text, add them under 'options'. "
-        "Return ONLY valid minified JSON.\n\nRAW:\n"
-        + json.dumps(raw_schema, ensure_ascii=False)
-    )
+    """Final schema normalization and cleanup"""
+    
+    prompt = f"""You are given a raw extracted schema for a form. Normalize it to a clean, production-ready JSON with:
 
-    if provider == "ollama":
-        return _ask_ollama_json(prompt)
-    elif provider == "openai":
-        return _ask_openai_json(prompt)
-    elif provider == "gemini":
-        return _ask_gemini_json(prompt)
-    else:
-        logger.warning(f"Unknown LLM_PROVIDER '{provider}', returning raw schema.")
-        return raw_schema
+1. Stable field IDs (snake_case, descriptive)
+2. Human-readable labels
+3. Proper types: text, checkbox, radio, signature, date, table_cell, unknown
+4. Preserve ALL bounding boxes and page numbers exactly as provided
+5. Keep inferred options for checkbox/radio fields
+6. Add a document_title if you can infer it from the fields
 
+Return ONLY valid JSON in this format:
+{{
+  "document_title": "Application Form" or "Unknown Form",
+  "total_pages": 1,
+  "fields": [
+    {{
+      "id": "full_name",
+      "label": "Full Name",
+      "type": "text",
+      "page": 1,
+      "question_bbox": [x1, y1, x2, y2],
+      "answer_bboxes": [[x1, y1, x2, y2]],
+      "options": [],
+      "required": true
+    }}
+  ]
+}}
 
-def _ask_ollama_json(prompt: str) -> Dict[str, Any]:
-    """
-    Minimal Ollama client using HTTP. Requires an appropriate local model (e.g., llama3:instruct).
-    export OLLAMA_HOST=http://localhost:11434
-    """
-    import requests
-    model = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
+Raw schema:
+{json.dumps(raw_schema, indent=2, ensure_ascii=False)}
 
-    r = requests.post(
-        f"{OLLAMA_HOST}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False, "format": "json"}
-    )
-    r.raise_for_status()
-    obj = r.json()
-    txt = obj.get("response", "{}")
+Return ONLY the normalized JSON, no markdown, no explanations."""
+
+    logger.info("Calling LLM for final schema normalization...")
+    
     try:
-        return json.loads(txt)
-    except Exception:
-        # Try to extract JSON substring
-        try:
-            start = txt.find("{")
-            end = txt.rfind("}")
-            return json.loads(txt[start:end+1])
-        except Exception:
-            logger.warning("Ollama returned non-JSON; falling back to raw.")
-            return {"raw_llm_text": txt}
-
-
-def _ask_openai_json(prompt: str) -> Dict[str, Any]:
-    """
-    OpenAI JSON Completion via Chat Completions w/ response_format (older API may differ).
-    Requires: pip install openai
-    export OPENAI_API_KEY=...
-    """
-    try:
-        from openai import OpenAI
+        normalized = call_ollama(prompt, json_mode=True)
+        return normalized
     except Exception as e:
-        logger.error("pip install openai to use OPENAI provider.")
-        return {"error": str(e)}
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "Return only valid compact JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
-    )
-    txt = resp.choices[0].message.content
-    try:
-        return json.loads(txt)
-    except Exception:
-        return {"raw_llm_text": txt}
-
-
-def _ask_gemini_json(prompt: str) -> Dict[str, Any]:
-    """
-    Google Gemini JSON mode. Requires: pip install google-generativeai
-    export GEMINI_API_KEY=...
-    """
-    try:
-        import google.generativeai as genai
-    except Exception as e:
-        logger.error("pip install google-generativeai to use GEMINI provider.")
-        return {"error": str(e)}
-
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
-    resp = model.generate_content(
-        [
-            {"role": "user", "parts": [prompt]}
-        ],
-        generation_config={"response_mime_type": "application/json"}
-    )
-    txt = resp.text or "{}"
-    try:
-        return json.loads(txt)
-    except Exception:
-        return {"raw_llm_text": txt}
+        logger.error(f"Schema normalization failed: {e}")
+        return {"error": str(e), "raw": raw_schema}
 
 
 # -----------------------------
-# Main pipeline
+# Main Pipeline
 # -----------------------------
 def process_pdf(
     pdf_path: str,
@@ -630,23 +637,38 @@ def process_pdf(
     out_dir: str = OUTPUT_DIR,
     make_debug_images: bool = True
 ) -> DocumentSchema:
+    """
+    Main pipeline with LLM-enhanced question identification and matching
+    """
     t0 = time.time()
     out_root = Path(out_dir)
     (out_root / "annotated").mkdir(parents=True, exist_ok=True)
 
     models = Models(yolo_weights)
-
-    pages = pdf_to_images(pdf_path, dpi=300)
+    pages = load_images(pdf_path, dpi=300)
     page_results: List[PageResult] = []
 
     for idx, pil_img in enumerate(pages, start=1):
-        logger.info(f"Page {idx}/{len(pages)}: running detectors...")
+        logger.info(f"Processing page {idx}/{len(pages)}...")
 
+        # Step 1: YOLO detections
+        logger.info(f"  - Running YOLO detection...")
         dets = detect_answer_regions_yolo(models, pil_img)
+        logger.info(f"  - Found {len(dets)} answer regions")
+
+        # Step 2: OCR
+        logger.info(f"  - Running OCR...")
         ocr_lines = ocr_image(models, pil_img)
+        logger.info(f"  - Extracted {len(ocr_lines)} text lines")
+
         page_w, page_h = pil_img.size
 
-        fields = build_fields_for_page(ocr_lines, dets, page_w, page_h)
+        # Step 3: LLM matching (replaces heuristics)
+        logger.info(f"  - Matching questions to answers with LLM...")
+        fields = llm_match_questions_to_answers(
+            ocr_lines, dets, page_w, page_h, pil_img
+        )
+        logger.info(f"  - Matched {len(fields)} fields")
 
         pr = PageResult(
             page_number=idx,
@@ -658,13 +680,16 @@ def process_pdf(
         )
         page_results.append(pr)
 
+        # Debug visualization
         if make_debug_images:
             out_img = out_root / "annotated" / f"page_{idx:03d}_annotated.jpg"
             draw_debug(pil_img, ocr_lines, dets, fields, out_img)
+            logger.info(f"  - Saved debug image: {out_img}")
 
-    # Build raw schema for LLM
+    # Build raw schema
     raw_schema = {
         "document_id": Path(pdf_path).stem,
+        "total_pages": len(page_results),
         "pages": [
             {
                 "page": p.page_number,
@@ -675,7 +700,8 @@ def process_pdf(
                         "question_bbox": f.question_bbox,
                         "answer_type": f.answer_type,
                         "answer_bboxes": f.answer_bboxes,
-                        "yolo_classes": f.yolo_classes
+                        "yolo_classes": f.yolo_classes,
+                        "options": f.options
                     }
                     for f in p.fields
                 ]
@@ -683,10 +709,11 @@ def process_pdf(
         ]
     }
 
-    logger.info("Calling LLM to normalize schema...")
-    normalized = ask_llm_normalize_schema(LLM_PROVIDER, raw_schema)
+    # Final normalization
+    logger.info("Running final schema normalization...")
+    normalized = normalize_schema_with_llm(raw_schema)
 
-    # Save outputs
+    # Save results
     schema_path = out_root / "document_schema.json"
     with open(schema_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -697,8 +724,11 @@ def process_pdf(
             f, indent=2, ensure_ascii=False
         )
 
-    logger.info(f"Done. Wrote schema to: {schema_path}")
-    logger.info(f"Total time: {time.time() - t0:.1f}s")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"✓ Processing complete!")
+    logger.info(f"✓ Schema saved to: {schema_path}")
+    logger.info(f"✓ Total time: {time.time() - t0:.1f}s")
+    logger.info(f"{'='*60}\n")
 
     doc = DocumentSchema(pages=page_results, normalized_schema=normalized)
     return doc
@@ -710,11 +740,19 @@ def process_pdf(
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="Extract form schema from a PDF.")
-    ap.add_argument("pdf", help="Path to form PDF")
-    ap.add_argument("--yolo", default=YOLO_MODEL_PATH, help="Path to YOLO weights (default: best.pt or $YOLO_MODEL_PATH)")
-    ap.add_argument("--out", default=OUTPUT_DIR, help="Output dir (default: ./output)")
+    ap = argparse.ArgumentParser(
+        description="LLM-Enhanced Form Schema Extractor. "
+        "Supports PDF (.pdf) and image files (.jpg, .jpeg, .png, .bmp, .tiff, .gif, .webp)."
+    )
+    ap.add_argument("pdf", help="Path to form PDF or image file")
+    ap.add_argument("--yolo", default=YOLO_MODEL_PATH, help=f"YOLO weights path (default: {YOLO_MODEL_PATH})")
+    ap.add_argument("--out", default=OUTPUT_DIR, help=f"Output directory (default: {OUTPUT_DIR})")
     ap.add_argument("--no-debug", action="store_true", help="Disable annotated debug images")
     args = ap.parse_args()
 
-    process_pdf(args.pdf, yolo_weights=args.yolo, out_dir=args.out, make_debug_images=not args.no_debug)
+    process_pdf(
+        args.pdf,
+        yolo_weights=args.yolo,
+        out_dir=args.out,
+        make_debug_images=not args.no_debug
+    )

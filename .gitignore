@@ -6,4 +6,5 @@ myenv
 venv/
 .DS_Store
 *.log
+best.pt
 
